@@ -43,7 +43,7 @@ router.get('/bandwidth', auth, async (req, res) => {
     const bandwidthData = await mikrotikService.getBandwidthUsage();
     res.json({
       success: true,
-      data: bandwidthData
+      data: bandwidthData || []
     });
   } catch (error) {
     logger.error(`Error obteniendo ancho de banda: ${error.message}`);
@@ -51,6 +51,29 @@ router.get('/bandwidth', auth, async (req, res) => {
       success: false,
       message: 'Error obteniendo datos de ancho de banda',
       error: error.message
+    });
+  }
+});
+
+// ENDPOINT FALTANTE - bandwidth-history
+router.get('/bandwidth-history', auth, async (req, res) => {
+  try {
+    logger.info('Solicitud recibida para obtener historial de ancho de banda');
+    const minutes = parseInt(req.query.minutes) || 5; // Por defecto últimos 5 minutos
+    const history = await mikrotikService.getBandwidthHistory(minutes);
+    
+    res.json({
+      success: true,
+      data: history || [],
+      count: history.length
+    });
+  } catch (error) {
+    logger.error(`Error obteniendo historial de ancho de banda: ${error.message}`);
+    res.status(500).json({
+      success: false,
+      message: 'Error obteniendo historial de ancho de banda',
+      error: error.message,
+      data: [] // Enviar array vacío en caso de error
     });
   }
 });
@@ -189,24 +212,6 @@ router.get('/status', auth, async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Error conectando con MikroTik',
-      error: error.message
-    });
-  }
-});
-
-// En tu router
-router.get('/bandwidth-history', auth, async (req, res) => {
-  try {
-    const history = await mikrotikService.getBandwidthHistory();
-    res.json({
-      success: true,
-      data: history
-    });
-  } catch (error) {
-    logger.error(`Error obteniendo historial: ${error.message}`);
-    res.status(500).json({
-      success: false,
-      message: 'Error obteniendo historial de ancho de banda',
       error: error.message
     });
   }

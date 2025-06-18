@@ -12,6 +12,9 @@ class MikrotikService {
       timeout: 10000
     };
     this.bandwidthHistory = [];
+    this.bandwidthCache = null;
+    this.cacheTimeout = 1000; // 1 segundo de cache
+    this.lastCacheTime = 0;
   }
 
   async connect() {
@@ -42,6 +45,7 @@ class MikrotikService {
   async disconnect() {
     if (this.conn && this.conn.connected) {
       await this.conn.close();
+      this.conn = null;
       logger.info('Desconectado de MikroTik');
     }
   }
@@ -56,6 +60,11 @@ class MikrotikService {
           throw error;
         }
         await new Promise(resolve => setTimeout(resolve, delay));
+        // Reconectar en el último intento
+        if (attempt === maxAttempts - 1) {
+          this.conn = null;
+          await this.connect();
+        }
       }
     }
   }
@@ -65,13 +74,29 @@ class MikrotikService {
       logger.debug('Obteniendo usuarios conectados');
       const conn = await this.connect();
 
-      const [arpEntries, dhcpLeases] = await Promise.all([
+      const [arpEntries, dhcpLeases, queues] = await Promise.all([
         this.retryOperation(() => conn.write('/ip/arp/print')),
-        this.retryOperation(() => conn.write('/ip/dhcp-server/lease/print'))
+        this.retryOperation(() => conn.write('/ip/dhcp-server/lease/print')),
+        this.retryOperation(() => conn.write('/queue/simple/print'))
       ]);
+
+      // Crear mapa de límites de velocidad
+      const speedLimits = {};
+      queues.forEach(queue => {
+        const target = queue.target?.split('/')[0];
+        if (target) {
+          speedLimits[target] = {
+            maxLimit: queue['max-limit'],
+            bytesIn: parseInt(queue.bytes) || 0,
+            bytesOut: parseInt(queue['bytes-out']) || 0
+          };
+        }
+      });
 
       const users = arpEntries.map(arp => {
         const lease = dhcpLeases.find(l => l['mac-address'] === arp['mac-address']);
+        const speedLimit = speedLimits[arp.address];
+        
         return {
           id: arp['.id'],
           ip: arp.address,
@@ -79,7 +104,12 @@ class MikrotikService {
           interface: arp.interface,
           hostname: lease ? lease['host-name'] || arp['mac-address'] : arp['mac-address'],
           status: arp.dynamic === 'true' ? 'Activo' : 'Estático',
-          lastSeen: arp['last-seen'] || 'N/A'
+          lastSeen: arp['last-seen'] || 'N/A',
+          speedLimit: speedLimit ? speedLimit.maxLimit : 'Sin límite',
+          bandwidth: speedLimit ? {
+            bytesIn: speedLimit.bytesIn,
+            bytesOut: speedLimit.bytesOut
+          } : null
         };
       });
       
@@ -93,6 +123,13 @@ class MikrotikService {
 
   async getBandwidthUsage() {
     try {
+      // Implementar cache para reducir carga en MikroTik
+      const now = Date.now();
+      if (this.bandwidthCache && (now - this.lastCacheTime) < this.cacheTimeout) {
+        logger.debug('Devolviendo datos de cache');
+        return this.bandwidthCache;
+      }
+
       logger.debug('Obteniendo uso de ancho de banda');
       const conn = await this.connect();
       
@@ -101,34 +138,62 @@ class MikrotikService {
         conn.write('/interface/print')
       );
       
-      const bandwidthData = [];
-      const now = new Date().toISOString();
+      logger.debug(`Interfaces encontradas: ${interfaces.length}`);
       
-      // Procesar interfaces principales
-      for (const iface of interfaces.filter(i => ['ether1', 'wlan1', 'bridge'].includes(i.name))) {
+      const bandwidthData = [];
+      const timestamp = new Date().toISOString();
+      
+      // En HAP Lite, las interfaces pueden ser diferentes
+      // Buscar interfaces activas y relevantes
+      const activeInterfaces = interfaces.filter(i => 
+        i.running === 'true' && 
+        (i.type === 'ether' || i.type === 'wlan' || i.name === 'bridge' || i.name.includes('ether') || i.name.includes('wlan'))
+      );
+      
+      // Si no hay interfaces específicas, usar todas las activas
+      const interfacesToMonitor = activeInterfaces.length > 0 
+        ? activeInterfaces.slice(0, 5) // Máximo 5 interfaces
+        : interfaces.filter(i => i.running === 'true').slice(0, 3);
+      
+      logger.info(`Monitoreando ${interfacesToMonitor.length} interfaces: ${interfacesToMonitor.map(i => i.name).join(', ')}`);
+      
+      const statsPromises = interfacesToMonitor.map(async (iface) => {
         try {
-          const stats = await this.retryOperation(() =>
-            conn.write('/interface/monitor-traffic', {
-              interface: iface.name,
-              interval: 1,
-              once: true
-            }, { timeout: 2000 })
-          );
+          const stats = await this.retryOperation(async () => {
+            const result = await conn.write('/interface/monitor-traffic', [
+              `=interface=${iface.name}`,
+              '=once='
+            ]);
+            return result;
+          });
           
-          if (stats?.[0]) {
-            bandwidthData.push({
+          if (stats && stats.length > 0) {
+            const data = {
               interface: iface.name,
               rxBits: parseInt(stats[0]['rx-bits-per-second']) || 0,
               txBits: parseInt(stats[0]['tx-bits-per-second']) || 0,
               rxBytes: parseInt(stats[0]['rx-byte']) || 0,
               txBytes: parseInt(stats[0]['tx-byte']) || 0,
-              timestamp: now
-            });
+              rxPackets: parseInt(stats[0]['rx-packet']) || 0,
+              txPackets: parseInt(stats[0]['tx-packet']) || 0,
+              timestamp: timestamp
+            };
+            logger.debug(`Datos de ${iface.name}: RX=${data.rxBits} bps, TX=${data.txBits} bps`);
+            return data;
           }
+          return null;
         } catch (error) {
           logger.warn(`Error monitoreando ${iface.name}: ${error.message}`);
+          return null;
         }
-      }
+      });
+      
+      const results = await Promise.all(statsPromises);
+      results.forEach(result => {
+        if (result) bandwidthData.push(result);
+      });
+      
+      logger.info(`Datos de ancho de banda obtenidos: ${bandwidthData.length} interfaces`);
       
       // Almacenar histórico (máximo 300 puntos)
       if (bandwidthData.length > 0) {
@@ -136,17 +201,24 @@ class MikrotikService {
         if (this.bandwidthHistory.length > 300) {
           this.bandwidthHistory = this.bandwidthHistory.slice(-300);
         }
+        
+        // Actualizar cache
+        this.bandwidthCache = bandwidthData;
+        this.lastCacheTime = now;
       }
       
-      return bandwidthData.length > 0 ? bandwidthData : null;
+      return bandwidthData.length > 0 ? bandwidthData : [];
     } catch (error) {
       logger.error(`Error obteniendo ancho de banda: ${error.message}`);
       throw new Error(`Error al obtener ancho de banda: ${error.message}`);
     }
   }
 
-  async getBandwidthHistory() {
-    return this.bandwidthHistory;
+  async getBandwidthHistory(minutes = 5) {
+    const cutoffTime = new Date(Date.now() - minutes * 60 * 1000);
+    return this.bandwidthHistory.filter(entry => 
+      new Date(entry.timestamp) > cutoffTime
+    );
   }
 
   async setSpeedLimit(userIp, rxLimit, txLimit) {
@@ -203,11 +275,11 @@ class MikrotikService {
     }
   }
 
-  async kickUser(userIp) {
+async kickUser(userIp) {
   try {
     const conn = await this.connect();
 
-    // 1. Crear la lista 'api_blocked' si no existe (con una IP temporal)
+    // 1. Crear lista si no existe (con IP temporal)
     try {
       await conn.write('/ip/firewall/address-list/add', [
         '=list=api_blocked',
@@ -216,13 +288,10 @@ class MikrotikService {
         '=timeout=1s'
       ]);
     } catch (e) {
-      // Ignorar si la lista ya existe
-      if (!e.message.includes('already have')) {
-        throw e;
-      }
+      if (!e.message.includes('already have')) throw e;
     }
 
-    // 2. Verificar/Crear la regla de firewall
+    // 2. Verificar/crear regla de firewall
     const firewallRules = await conn.write('/ip/firewall/filter/print', [
       '?comment=bloqueo_api'
     ]);
@@ -236,16 +305,17 @@ class MikrotikService {
       ]);
     }
 
-    // 3. Agregar la IP a bloquear
+    // 3. Bloquear IP
     const result = await conn.write('/ip/firewall/address-list/add', [
       '=list=api_blocked',
       `=address=${userIp}`,
-      '=comment=Bloqueado_por_API'
+      '=comment=Bloqueado_por_API',
+      '=timeout=5m'
     ]);
 
     return {
       success: true,
-      message: `IP ${userIp} bloqueada exitosamente`,
+      message: `IP ${userIp} bloqueada por 5 minutos`,
       ruleId: result['.id']
     };
   } catch (error) {
@@ -254,44 +324,35 @@ class MikrotikService {
   }
 }
 
-
-
 async unblockUser(userIp) {
   try {
     const conn = await this.connect();
     
-    // Eliminar todas las reglas que bloqueen esta IP
-    const rules = await conn.write('/ip/firewall/filter/print', [
-      `?src-address=${userIp}`,
-      '?action=drop'
-    ]);
-    
-    // También eliminar de address-list
+    // Buscar y eliminar todas las entradas relacionadas
     const listEntries = await conn.write('/ip/firewall/address-list/print', [
       '?list=api_blocked',
       `?address=${userIp}`
     ]);
 
-    // Eliminar todas las entradas encontradas
-    const allEntries = [...rules, ...listEntries];
-    for (const entry of allEntries) {
-      const cmd = entry.list ? 
-        '/ip/firewall/address-list/remove' : 
-        '/ip/firewall/filter/remove';
-      
-      await conn.write([cmd, `=.id=${entry['.id']}`]);
+    let removed = 0;
+    for (const entry of listEntries) {
+      await conn.write('/ip/firewall/address-list/remove', [
+        `=.id=${entry['.id']}`
+      ]);
+      removed++;
     }
 
     return {
       success: true,
       message: `IP ${userIp} desbloqueada`,
-      rulesRemoved: allEntries.length
+      rulesRemoved: removed
     };
   } catch (error) {
     logger.error(`Error desbloqueando usuario: ${error.message}`);
     throw new Error(`Error al desbloquear usuario: ${error.message}`);
   }
 }
+
 
   async getActiveQueues() {
     try {
@@ -319,13 +380,35 @@ async unblockUser(userIp) {
   async checkMikrotikConnection() {
     try {
       const conn = await this.connect();
-      await this.retryOperation(() => 
+      const result = await this.retryOperation(() => 
         conn.write('/system/resource/print')
       );
-      return true;
+      return result && result.length > 0;
     } catch (error) {
       logger.error(`Error verificando conexión: ${error.message}`);
       return false;
+    }
+  }
+
+  // Obtener estadísticas del sistema
+  async getSystemStats() {
+    try {
+      const conn = await this.connect();
+      const [resource, health] = await Promise.all([
+        this.retryOperation(() => conn.write('/system/resource/print')),
+        this.retryOperation(() => conn.write('/system/health/print'))
+      ]);
+
+      return {
+        cpuLoad: resource[0]['cpu-load'],
+        memoryFree: resource[0]['free-memory'],
+        memoryTotal: resource[0]['total-memory'],
+        uptime: resource[0].uptime,
+        temperature: health[0]?.temperature || 'N/A'
+      };
+    } catch (error) {
+      logger.error(`Error obteniendo estadísticas del sistema: ${error.message}`);
+      throw new Error(`Error al obtener estadísticas: ${error.message}`);
     }
   }
 }
