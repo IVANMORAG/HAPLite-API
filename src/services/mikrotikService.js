@@ -305,42 +305,54 @@ formatBandwidth(bitsPerSecond) {
   }
 
 
-
-  // Mejora la función setSpeedLimit en mikrotikService.js
+// REEMPLAZA COMPLETAMENTE la función setSpeedLimit en mikrotikService.js
 async setSpeedLimit(userIp, rxLimit, txLimit) {
   try {
     const conn = await this.connect();
     
-    // Formatear límites (para HAP Lite es importante el formato correcto)
-    const limitString = `${rxLimit}/${txLimit}`;
+    logger.info(`Estableciendo límite para ${userIp}: RX=${rxLimit}, TX=${txLimit} (${rxLimit/1000000}/${txLimit/1000000} Mbps)`);
     
+    // CASO ESPECIAL: Si ambos límites son 0, BLOQUEAR completamente
+    if (rxLimit === 0 && txLimit === 0) {
+      return await this.blockUserCompletely(userIp);
+    }
+    
+    // CASO ESPECIAL: Si uno de los límites es 0, usar valor muy bajo (1 bps)
+    const effectiveRxLimit = rxLimit === 0 ? 1 : rxLimit;  // 1 bit por segundo = prácticamente bloqueado
+    const effectiveTxLimit = txLimit === 0 ? 1 : txLimit;
+    
+    const limitString = `${effectiveRxLimit}/${effectiveTxLimit}`;
+    
+    // Primero, remover cualquier bloqueo de firewall existente
+    await this.unblockUser(userIp);
+    
+    // Remover reglas de queue existentes
     const existingRules = await this.retryOperation(() =>
       conn.write('/queue/simple/print', { '?target': userIp + '/32' })
     );
     
-    if (existingRules.length > 0) {
-      // Actualizar regla existente
+    for (const rule of existingRules) {
       await this.retryOperation(() =>
-        conn.write('/queue/simple/set', {
-          '.id': existingRules[0]['.id'],
-          'max-limit': limitString
-        })
+        conn.write('/queue/simple/remove', { '.id': rule['.id'] })
       );
-      logger.info(`Límite actualizado para ${userIp}: ${limitString}`);
-    } else {
-      // Crear nueva regla
-      await this.retryOperation(() =>
-        conn.write('/queue/simple/add', {
-          name: `limit_${userIp.replace(/\./g, '_')}_${Date.now()}`,
-          target: userIp + '/32',
-          'max-limit': limitString,
-          comment: `API_LIMIT_${new Date().toISOString()}`
-        })
-      );
-      logger.info(`Nuevo límite creado para ${userIp}: ${limitString}`);
+      logger.info(`Regla anterior removida para ${userIp}: ${rule['.id']}`);
     }
     
-    // Verificar que el límite se aplicó correctamente (esperar 2 segundos)
+    // Crear nueva regla de queue
+    const queueName = `limit_${userIp.replace(/\./g, '_')}_${Date.now()}`;
+    const result = await this.retryOperation(() =>
+      conn.write('/queue/simple/add', {
+        name: queueName,
+        target: userIp + '/32',
+        'max-limit': limitString,
+        comment: `API_LIMIT_${new Date().toISOString()}_RX${rxLimit}_TX${txLimit}`
+      })
+    );
+    
+    const queueId = result ? result['.id'] : null;
+    logger.info(`Nueva regla creada para ${userIp}: ${limitString}, Queue ID: ${queueId}`);
+    
+    // Verificar que se aplicó correctamente
     await new Promise(resolve => setTimeout(resolve, 2000));
     
     const verificationRules = await this.retryOperation(() =>
@@ -354,40 +366,155 @@ async setSpeedLimit(userIp, rxLimit, txLimit) {
       logger.warn(`Advertencia: El límite para ${userIp} podría no haberse aplicado correctamente`);
     }
     
+    // Mensaje personalizado según el tipo de límite
+    let message;
+    if (rxLimit === 0 || txLimit === 0) {
+      message = `Límite extremo aplicado para ${userIp} (${(effectiveRxLimit/1000000).toFixed(3)}/${(effectiveTxLimit/1000000).toFixed(3)} Mbps) - Internet prácticamente bloqueado`;
+    } else {
+      message = `Límite establecido correctamente para ${userIp} (${(rxLimit/1000000).toFixed(1)}/${(txLimit/1000000).toFixed(1)} Mbps)`;
+    }
+    
     return { 
       success: true, 
-      message: `Límite establecido correctamente para ${userIp}`,
+      message: message,
       applied: applied,
-      limit: limitString
+      limit: limitString,
+      originalLimits: { rx: rxLimit, tx: txLimit },
+      effectiveLimits: { rx: effectiveRxLimit, tx: effectiveTxLimit },
+      limitFormatted: `${(rxLimit/1000000).toFixed(1)} / ${(txLimit/1000000).toFixed(1)} Mbps`,
+      userIp: userIp,
+      queueId: queueId,
+      isBlocked: (rxLimit === 0 && txLimit === 0),
+      isRestricted: (rxLimit === 0 || txLimit === 0),
+      verification: {
+        rules: verificationRules.length,
+        maxLimit: verificationRules[0]?.['max-limit'] || null
+      }
     };
   } catch (error) {
-    logger.error(`Error estableciendo límite: ${error.message}`);
+    logger.error(`Error estableciendo límite para ${userIp}: ${error.message}`);
     throw new Error(`Error al establecer límite: ${error.message}`);
   }
 }
 
-
-
-  async removeSpeedLimit(userIp) {
+// NUEVA FUNCIÓN: Bloquear usuario completamente con firewall
+async blockUserCompletely(userIp) {
+  try {
+    const conn = await this.connect();
+    
+    logger.info(`Bloqueando completamente a ${userIp} usando firewall`);
+    
+    // 1. Crear lista de bloqueo si no existe
     try {
-      const conn = await this.connect();
-      const rules = await this.retryOperation(() =>
-        conn.write('/queue/simple/print', { '?target': userIp + '/32' })
-      );
-      
-      for (const rule of rules) {
-        await this.retryOperation(() =>
-          conn.write('/queue/simple/remove', { '.id': rule['.id'] })
-        );
+      await conn.write('/ip/firewall/address-list/add', [
+        '=list=api_speed_blocked',
+        '=address=127.0.0.1',
+        '=comment=Lista_bloqueo_velocidad',
+        '=timeout=1s'
+      ]);
+    } catch (e) {
+      if (!e.message.includes('already have')) {
+        logger.debug('Lista api_speed_blocked ya existe o error menor:', e.message);
       }
-      
-      logger.info(`Límite removido para ${userIp}`);
-      return { success: true, message: 'Límite removido correctamente' };
-    } catch (error) {
-      logger.error(`Error removiendo límite: ${error.message}`);
-      throw new Error(`Error al remover límite: ${error.message}`);
     }
+
+    // 2. Verificar/crear regla de firewall para bloqueo por velocidad
+    const firewallRules = await conn.write('/ip/firewall/filter/print', [
+      '?comment=bloqueo_velocidad_api'
+    ]);
+
+    if (firewallRules.length === 0) {
+      await conn.write('/ip/firewall/filter/add', [
+        '=chain=forward',
+        '=src-address-list=api_speed_blocked',
+        '=action=drop',
+        '=comment=bloqueo_velocidad_api'
+      ]);
+      logger.info('Regla de firewall para bloqueo por velocidad creada');
+    }
+
+    // 3. Agregar IP a la lista de bloqueo
+    const result = await conn.write('/ip/firewall/address-list/add', [
+      '=list=api_speed_blocked',
+      `=address=${userIp}`,
+      '=comment=Bloqueado_por_limite_0_API'
+    ]);
+
+    // 4. También crear una regla de queue con límite mínimo como respaldo
+    const existingRules = await this.retryOperation(() =>
+      conn.write('/queue/simple/print', { '?target': userIp + '/32' })
+    );
+    
+    for (const rule of existingRules) {
+      await this.retryOperation(() =>
+        conn.write('/queue/simple/remove', { '.id': rule['.id'] })
+      );
+    }
+
+    const queueName = `blocked_${userIp.replace(/\./g, '_')}_${Date.now()}`;
+    await this.retryOperation(() =>
+      conn.write('/queue/simple/add', {
+        name: queueName,
+        target: userIp + '/32',
+        'max-limit': '1/1', // 1 bit por segundo
+        comment: `API_BLOCKED_${new Date().toISOString()}`
+      })
+    );
+
+    return {
+      success: true,
+      message: `IP ${userIp} bloqueada completamente (sin acceso a internet)`,
+      isBlocked: true,
+      method: 'firewall_and_queue',
+      ruleId: result['.id'] || null,
+      userIp: userIp,
+      limitFormatted: '0.0 / 0.0 Mbps (Bloqueado)',
+      verification: {
+        firewallBlocked: true,
+        queueLimited: true
+      }
+    };
+  } catch (error) {
+    logger.error(`Error bloqueando completamente a ${userIp}: ${error.message}`);
+    throw new Error(`Error al bloquear usuario: ${error.message}`);
   }
+}
+
+// FUNCIÓN MEJORADA: Remover límite completamente
+async removeSpeedLimit(userIp) {
+  try {
+    const conn = await this.connect();
+    
+    logger.info(`Removiendo todos los límites para ${userIp}`);
+    
+    // 1. Remover de listas de firewall
+    await this.unblockUser(userIp);
+    
+    // 2. Remover reglas de queue
+    const rules = await this.retryOperation(() =>
+      conn.write('/queue/simple/print', { '?target': userIp + '/32' })
+    );
+    
+    for (const rule of rules) {
+      await this.retryOperation(() =>
+        conn.write('/queue/simple/remove', { '.id': rule['.id'] })
+      );
+      logger.info(`Regla de queue removida para ${userIp}: ${rule['.id']}`);
+    }
+    
+    logger.info(`Todos los límites removidos para ${userIp} (${rules.length} reglas eliminadas)`);
+    
+    return { 
+      success: true, 
+      message: `Límites removidos completamente para ${userIp} - velocidad sin restricciones`,
+      rulesRemoved: rules.length,
+      userIp: userIp
+    };
+  } catch (error) {
+    logger.error(`Error removiendo límite: ${error.message}`);
+    throw new Error(`Error al remover límite: ${error.message}`);
+  }
+}
 
 async kickUser(userIp) {
   try {
@@ -438,22 +565,31 @@ async kickUser(userIp) {
   }
 }
 
+// FUNCIÓN MEJORADA: Desbloquear usuario (actualiza la existente)
 async unblockUser(userIp) {
   try {
     const conn = await this.connect();
     
-    // Buscar y eliminar todas las entradas relacionadas
-    const listEntries = await conn.write('/ip/firewall/address-list/print', [
-      '?list=api_blocked',
-      `?address=${userIp}`
-    ]);
-
+    // Eliminar de listas de firewall (tanto bloqueo temporal como por velocidad)
+    const lists = ['api_blocked', 'api_speed_blocked'];
     let removed = 0;
-    for (const entry of listEntries) {
-      await conn.write('/ip/firewall/address-list/remove', [
-        `=.id=${entry['.id']}`
-      ]);
-      removed++;
+    
+    for (const listName of lists) {
+      try {
+        const listEntries = await conn.write('/ip/firewall/address-list/print', [
+          `?list=${listName}`,
+          `?address=${userIp}`
+        ]);
+
+        for (const entry of listEntries) {
+          await conn.write('/ip/firewall/address-list/remove', [
+            `=.id=${entry['.id']}`
+          ]);
+          removed++;
+        }
+      } catch (e) {
+        logger.debug(`Lista ${listName} no existe o sin entradas para ${userIp}`);
+      }
     }
 
     return {
@@ -466,6 +602,7 @@ async unblockUser(userIp) {
     throw new Error(`Error al desbloquear usuario: ${error.message}`);
   }
 }
+
 
 
   async getActiveQueues() {
