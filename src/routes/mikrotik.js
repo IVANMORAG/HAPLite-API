@@ -82,8 +82,8 @@ router.post('/speed-limit',
   auth,
   [
     body('ip').isIP().withMessage('IP inválida'),
-    body('rxLimit').isInt({ min: 1 }).withMessage('Límite RX debe ser mayor a 0'),
-    body('txLimit').isInt({ min: 1 }).withMessage('Límite TX debe ser mayor a 0')
+    body('rxLimit').isInt({ min: 0 }).withMessage('Límite RX debe ser mayor o igual 0'),
+    body('txLimit').isInt({ min: 0 }).withMessage('Límite TX debe ser mayor o igual 0')
   ],
   validate,
   async (req, res) => {

@@ -69,57 +69,140 @@ class MikrotikService {
     }
   }
 
-  async getConnectedUsers() {
-    try {
-      logger.debug('Obteniendo usuarios conectados');
-      const conn = await this.connect();
 
-      const [arpEntries, dhcpLeases, queues] = await Promise.all([
-        this.retryOperation(() => conn.write('/ip/arp/print')),
-        this.retryOperation(() => conn.write('/ip/dhcp-server/lease/print')),
-        this.retryOperation(() => conn.write('/queue/simple/print'))
-      ]);
+ // Reemplaza la función getConnectedUsers() en tu mikrotikService.js
 
-      // Crear mapa de límites de velocidad
-      const speedLimits = {};
-      queues.forEach(queue => {
-        const target = queue.target?.split('/')[0];
-        if (target) {
-          speedLimits[target] = {
-            maxLimit: queue['max-limit'],
-            bytesIn: parseInt(queue.bytes) || 0,
-            bytesOut: parseInt(queue['bytes-out']) || 0
-          };
-        }
-      });
+// REEMPLAZA la función getConnectedUsers() en mikrotikService.js
 
-      const users = arpEntries.map(arp => {
-        const lease = dhcpLeases.find(l => l['mac-address'] === arp['mac-address']);
-        const speedLimit = speedLimits[arp.address];
+async getConnectedUsers() {
+  try {
+    logger.debug('Obteniendo usuarios conectados');
+    const conn = await this.connect();
+
+    const [arpEntries, dhcpLeases, queues] = await Promise.all([
+      this.retryOperation(() => conn.write('/ip/arp/print')),
+      this.retryOperation(() => conn.write('/ip/dhcp-server/lease/print')),
+      this.retryOperation(() => conn.write('/queue/simple/print'))
+    ]);
+
+    // Crear mapa de límites de velocidad
+    const speedLimits = {};
+    queues.forEach(queue => {
+      const target = queue.target?.split('/')[0];
+      if (target) {
+        const maxLimit = queue['max-limit'] || '';
         
-        return {
-          id: arp['.id'],
-          ip: arp.address,
-          mac: arp['mac-address'],
-          interface: arp.interface,
-          hostname: lease ? lease['host-name'] || arp['mac-address'] : arp['mac-address'],
-          status: arp.dynamic === 'true' ? 'Activo' : 'Estático',
-          lastSeen: arp['last-seen'] || 'N/A',
-          speedLimit: speedLimit ? speedLimit.maxLimit : 'Sin límite',
-          bandwidth: speedLimit ? {
-            bytesIn: speedLimit.bytesIn,
-            bytesOut: speedLimit.bytesOut
-          } : null
+        // Parsear límites para mostrar números reales
+        let uploadSpeed = 'Sin límite';
+        let downloadSpeed = 'Sin límite';
+        
+        if (maxLimit && maxLimit !== '') {
+          const [upload, download] = maxLimit.split('/');
+          if (upload && download) {
+            uploadSpeed = this.parseSpeedToMbps(upload);
+            downloadSpeed = this.parseSpeedToMbps(download);
+          }
+        }
+        
+        speedLimits[target] = {
+          maxLimit: maxLimit,
+          uploadSpeed: uploadSpeed,
+          downloadSpeed: downloadSpeed,
+          hasLimit: maxLimit && maxLimit !== '',
+          bytesIn: parseInt(queue.bytes) || 0,
+          bytesOut: parseInt(queue['bytes-out']) || 0
         };
-      });
+      }
+    });
+
+    const users = arpEntries.map(arp => {
+      const lease = dhcpLeases.find(l => l['mac-address'] === arp['mac-address']);
+      const speedLimit = speedLimits[arp.address];
       
-      logger.debug(`Usuarios encontrados: ${users.length}`);
-      return users;
-    } catch (error) {
-      logger.error(`Error obteniendo usuarios: ${error.message}`);
-      throw new Error(`Error al obtener usuarios: ${error.message}`);
+      // Determinar el nombre del dispositivo
+      let deviceName = arp['mac-address']; // Por defecto usar MAC
+      if (lease && lease['host-name']) {
+        deviceName = lease['host-name'];
+      }
+      
+      // Formatear velocidad de conexión
+      let velocidadConexion = 'Sin límite';
+      if (speedLimit && speedLimit.hasLimit) {
+        velocidadConexion = `${speedLimit.uploadSpeed} / ${speedLimit.downloadSpeed}`;
+      }
+      
+      return {
+        id: arp['.id'],
+        ip: arp.address,
+        mac: arp['mac-address'],
+        interface: arp.interface,
+        dispositivo: deviceName,
+        status: arp.dynamic === 'true' ? 'Activo' : 'Estático',
+        lastSeen: arp['last-seen'] || 'N/A',
+        velocidadConexion: velocidadConexion,
+        hasSpeedLimit: speedLimit ? speedLimit.hasLimit : false,
+        speedLimit: speedLimit ? speedLimit.maxLimit : null,
+        bandwidth: speedLimit ? {
+          bytesIn: speedLimit.bytesIn,
+          bytesOut: speedLimit.bytesOut
+        } : null
+      };
+    });
+    
+    logger.debug(`Usuarios encontrados: ${users.length}`);
+    return users;
+  } catch (error) {
+    logger.error(`Error obteniendo usuarios: ${error.message}`);
+    throw new Error(`Error al obtener usuarios: ${error.message}`);
+  }
+}
+
+// AGREGAR esta función auxiliar al final de la clase MikrotikService
+parseSpeedToMbps(speedString) {
+  if (!speedString) return 'Sin límite';
+  
+  // Convertir diferentes formatos a Mbps
+  const speed = speedString.toString().toLowerCase();
+  
+  if (speed.includes('k')) {
+    const value = parseFloat(speed.replace(/[^0-9.]/g, ''));
+    return `${(value / 1000).toFixed(1)} Mbps`;
+  } else if (speed.includes('m')) {
+    const value = parseFloat(speed.replace(/[^0-9.]/g, ''));
+    return `${value} Mbps`;
+  } else if (speed.includes('g')) {
+    const value = parseFloat(speed.replace(/[^0-9.]/g, ''));
+    return `${(value * 1000).toFixed(1)} Mbps`;
+  } else {
+    // Asumir que está en bits por segundo
+    const value = parseInt(speed);
+    if (value >= 1000000) {
+      return `${(value / 1000000).toFixed(1)} Mbps`;
+    } else if (value >= 1000) {
+      return `${(value / 1000).toFixed(1)} Kbps`;
+    } else {
+      return `${value} bps`;
     }
   }
+}
+
+// Función auxiliar para formatear bandwidth (agrégala al final de la clase)
+formatBandwidth(bitsPerSecond) {
+  if (bitsPerSecond === 0) return '0 bps';
+  
+  const units = ['bps', 'Kbps', 'Mbps', 'Gbps'];
+  let value = bitsPerSecond;
+  let unitIndex = 0;
+  
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex++;
+  }
+  
+  return `${value.toFixed(1)} ${units[unitIndex]}`;
+}
+
+
 
   async getBandwidthUsage() {
     try {
@@ -221,38 +304,69 @@ class MikrotikService {
     );
   }
 
-  async setSpeedLimit(userIp, rxLimit, txLimit) {
-    try {
-      const conn = await this.connect();
-      const existingRules = await this.retryOperation(() =>
-        conn.write('/queue/simple/print', { '?target': userIp + '/32' })
+
+
+  // Mejora la función setSpeedLimit en mikrotikService.js
+async setSpeedLimit(userIp, rxLimit, txLimit) {
+  try {
+    const conn = await this.connect();
+    
+    // Formatear límites (para HAP Lite es importante el formato correcto)
+    const limitString = `${rxLimit}/${txLimit}`;
+    
+    const existingRules = await this.retryOperation(() =>
+      conn.write('/queue/simple/print', { '?target': userIp + '/32' })
+    );
+    
+    if (existingRules.length > 0) {
+      // Actualizar regla existente
+      await this.retryOperation(() =>
+        conn.write('/queue/simple/set', {
+          '.id': existingRules[0]['.id'],
+          'max-limit': limitString
+        })
       );
-      
-      if (existingRules.length > 0) {
-        await this.retryOperation(() =>
-          conn.write('/queue/simple/set', {
-            '.id': existingRules[0]['.id'],
-            'max-limit': `${rxLimit}/${txLimit}`
-          })
-        );
-        logger.info(`Límite actualizado para ${userIp}: ${rxLimit}/${txLimit}`);
-      } else {
-        await this.retryOperation(() =>
-          conn.write('/queue/simple/add', {
-            name: `limit_${userIp.replace(/\./g, '_')}`,
-            target: userIp + '/32',
-            'max-limit': `${rxLimit}/${txLimit}`
-          })
-        );
-        logger.info(`Nuevo límite creado para ${userIp}: ${rxLimit}/${txLimit}`);
-      }
-      
-      return { success: true, message: 'Límite establecido correctamente' };
-    } catch (error) {
-      logger.error(`Error estableciendo límite: ${error.message}`);
-      throw new Error(`Error al establecer límite: ${error.message}`);
+      logger.info(`Límite actualizado para ${userIp}: ${limitString}`);
+    } else {
+      // Crear nueva regla
+      await this.retryOperation(() =>
+        conn.write('/queue/simple/add', {
+          name: `limit_${userIp.replace(/\./g, '_')}_${Date.now()}`,
+          target: userIp + '/32',
+          'max-limit': limitString,
+          comment: `API_LIMIT_${new Date().toISOString()}`
+        })
+      );
+      logger.info(`Nuevo límite creado para ${userIp}: ${limitString}`);
     }
+    
+    // Verificar que el límite se aplicó correctamente (esperar 2 segundos)
+    await new Promise(resolve => setTimeout(resolve, 2000));
+    
+    const verificationRules = await this.retryOperation(() =>
+      conn.write('/queue/simple/print', { '?target': userIp + '/32' })
+    );
+    
+    const applied = verificationRules.length > 0 && 
+                   verificationRules[0]['max-limit'] === limitString;
+    
+    if (!applied) {
+      logger.warn(`Advertencia: El límite para ${userIp} podría no haberse aplicado correctamente`);
+    }
+    
+    return { 
+      success: true, 
+      message: `Límite establecido correctamente para ${userIp}`,
+      applied: applied,
+      limit: limitString
+    };
+  } catch (error) {
+    logger.error(`Error estableciendo límite: ${error.message}`);
+    throw new Error(`Error al establecer límite: ${error.message}`);
   }
+}
+
+
 
   async removeSpeedLimit(userIp) {
     try {
